@@ -1,200 +1,149 @@
 #!/usr/bin/env python3
 import socket
-import select
+import threading
 import time
+import sys
 
 # --- Configuration ---
-# The LB listens on this address. Clients connect here.
 LISTENING_HOST = '10.0.0.1'
 LISTENING_PORT = 80
-
-# Backend server addresses and types
-# These are the servers the LB will connect to.
 SERVERS = {
     'serv1': {'host': '192.168.0.101', 'port': 80, 'type': 'VIDEO'},
     'serv2': {'host': '192.168.0.102', 'port': 80, 'type': 'VIDEO'},
     'serv3': {'host': '192.168.0.103', 'port': 80, 'type': 'MUSIC'},
 }
-
-# Request processing time multipliers based on server and request type
-# This is crucial for our scheduling logic.
-# (Server Type, Request Type) -> Multiplier
 TIME_MULTIPLIERS = {
-    ('VIDEO', 'M'): 2,
-    ('VIDEO', 'V'): 1,
-    ('VIDEO', 'P'): 1,
-    ('MUSIC', 'M'): 1,
-    ('MUSIC', 'V'): 3,
-    ('MUSIC', 'P'): 2,
+    ('VIDEO', 'M'): 2, ('VIDEO', 'V'): 1, ('VIDEO', 'P'): 1,
+    ('MUSIC', 'M'): 1, ('MUSIC', 'V'): 3, ('MUSIC', 'P'): 2,
 }
+BUFFER_SIZE = 2048
 
-BUFFER_SIZE = 2048 # Bytes
+# --- Global Shared State & Debug Flag ---
+server_sockets = {}
+server_finish_times = {}
+active_servers = SERVERS.copy()
+state_lock = threading.Lock()
+DEBUG_MODE = False
 
-# --- Main Load Balancer Logic ---
+
+def debug_print(*args, **kwargs):
+    if DEBUG_MODE:
+        print(*args, **kwargs)
+
 
 def get_estimated_processing_time(server_type, request):
-    """Calculates how long a request will take on a given server type."""
-    if len(request) < 2:
-        return 0 # Invalid request
-    
     request_type = request[0]
     base_duration = int(request[1])
-    
     multiplier = TIME_MULTIPLIERS.get((server_type, request_type), 1)
     return base_duration * multiplier
 
-def main():
-    """
-    Main function to run the Load Balancer.
-    - Connects to all backend servers.
-    - Listens for client connections.
-    - Uses select() to handle all I/O concurrently.
-    - Implements a 'Least Estimated Completion Time' scheduling policy.
-    """
-    print("--- Load Balancer Starting ---")
 
-    # --- Step 1: Connect to all backend servers ---
-    server_sockets = {}
-    # This dictionary will track the estimated time when each server will be free.
-    server_finish_times = {} 
+def handle_client(client_conn, client_addr):
+    """This function runs in a dedicated thread for each connected client."""
+    debug_print("Accepted connection from client {}, starting new thread.".format(client_addr))
+    try:
+        request = client_conn.recv(BUFFER_SIZE)
+        if not request:
+            return
+
+        request_str = request.decode().strip()
+
+        best_server_name = None
+        chosen_server_ip = None
+        chosen_server_socket = None
+
+        with state_lock:
+            if not active_servers:
+                print("No active servers available. Dropping request.")
+                return
+
+            earliest_finish_time = float('inf')
+            current_time = time.time()
+
+            for name, config in active_servers.items():
+                start_time = max(current_time, server_finish_times.get(name, 0))
+                processing_time = get_estimated_processing_time(config['type'], request_str)
+                finish_time = start_time + processing_time
+
+                if finish_time < earliest_finish_time:
+                    earliest_finish_time = finish_time
+                    best_server_name = name
+                    chosen_server_ip = config['host']
+
+            if best_server_name:
+                server_finish_times[best_server_name] = earliest_finish_time
+                chosen_server_socket = server_sockets.get(best_server_name)
+
+        if chosen_server_socket and best_server_name:
+            print("received request {} from {} sending to {}-----".format(request_str, client_addr[0], chosen_server_ip))
+
+            try:
+                chosen_server_socket.sendall(request)
+                response = chosen_server_socket.recv(BUFFER_SIZE)
+                client_conn.sendall(response)
+                debug_print("Successfully relayed response for request '{}' to client {}".format(request_str, client_addr))
+
+            except socket.error as e:
+                print("Error communicating with server {}: {}. Removing from pool.".format(best_server_name, e))
+                with state_lock:
+                    if best_server_name in active_servers:
+                        del active_servers[best_server_name]
+                        server_sockets[best_server_name].close()
+                        del server_sockets[best_server_name]
+        else:
+            print("Could not find a suitable server for request '{}'.".format(request_str))
+
+    except socket.error as e:
+        print("Socket error with client {}: {}".format(client_addr, e))
+    finally:
+        client_conn.close()
+        debug_print("Closed connection and thread for client {}.".format(client_addr))
+
+
+def main():
+    global DEBUG_MODE
+    if "-debug" in sys.argv:
+        DEBUG_MODE = True
+        debug_print("--- Debug mode enabled ---")
+
+    print("Connecting to servers-----")
 
     for name, config in SERVERS.items():
         try:
-            print(f"Connecting to server: {name} at {config['host']}:{config['port']}...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((config['host'], config['port']))
-            sock.setblocking(False) # Use non-blocking sockets
-            server_sockets[sock] = {'name': name, 'type': config['type']}
-            server_finish_times[name] = time.time() # Initially, servers are free now.
-            print(f"Successfully connected to {name}.")
+            server_sockets[name] = sock
+            server_finish_times[name] = time.time()
+            debug_print("Successfully connected to server {}.".format(name))
         except socket.error as e:
-            print(f"Error: Could not connect to server {name}. {e}")
-            return # Exit if a server connection fails
+            print("Error: Could not connect to server {}. Removing from active pool.".format(name, e))
+            if name in active_servers:
+                del active_servers[name]
 
-    # --- Step 2: Set up the listening socket for clients ---
+    if not active_servers:
+        print("Fatal: Could not connect to any backend servers. Exiting.")
+        return
+
     listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listening_socket.setblocking(False)
+    listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listening_socket.bind((LISTENING_HOST, LISTENING_PORT))
-    listening_socket.listen(10) # Allow a backlog of 10 connections
-    print(f"Load Balancer is listening on {LISTENING_HOST}:{LISTENING_PORT}")
+    listening_socket.listen(10)
+    debug_print("Load Balancer is listening on {}:{}".format(LISTENING_HOST, LISTENING_PORT))
 
-    # --- Step 3: Initialize data structures for select() ---
-    
-    # Sockets we are reading from
-    inputs = [listening_socket] + list(server_sockets.keys())
-    
-    # Sockets we are writing to (initially none)
-    outputs = []
-
-    # Map to link client sockets to their corresponding server sockets and vice-versa
-    # This is key to routing responses back to the correct client.
-    client_to_server = {}
-    server_to_client = {}
-
-    # --- Step 4: Main Event Loop using select() ---
-    print("\n--- Entering main event loop ---\n")
     try:
         while True:
-            # select() blocks until at least one socket is ready for I/O
-            readable, writable, exceptional = select.select(inputs, outputs, inputs)
-
-            # Handle readable sockets
-            for sock in readable:
-                if sock is listening_socket:
-                    # A new client is trying to connect
-                    client_conn, client_addr = sock.accept()
-                    print(f"Accepted connection from client {client_addr}")
-                    client_conn.setblocking(False)
-                    inputs.append(client_conn)
-                
-                elif sock in server_sockets:
-                    # Data received from a backend server (a response)
-                    response = sock.recv(BUFFER_SIZE)
-                    if response:
-                        print(f"Received response from server {server_sockets[sock]['name']}: {response.decode()}")
-                        # Find the client this response is for and send it
-                        client_socket = server_to_client.pop(sock, None)
-                        if client_socket:
-                            client_socket.send(response)
-                            # Clean up
-                            inputs.remove(client_socket)
-                            client_socket.close()
-                            print(f"Relayed response to client and closed connection.")
-                        else:
-                            print("Warning: Received response from server but couldn't find matching client.")
-                    else:
-                        # Server closed connection
-                        print(f"Server {server_sockets[sock]['name']} closed connection.")
-                        inputs.remove(sock)
-                        sock.close()
-
-                else: # It's a client socket with a new request
-                    request = sock.recv(BUFFER_SIZE)
-                    if request:
-                        request_str = request.decode().strip()
-                        print(f"Received request from client: {request_str}")
-
-                        # --- Scheduling Logic ---
-                        best_server_name = None
-                        earliest_finish_time = float('inf')
-
-                        current_time = time.time()
-
-                        for name, config in SERVERS.items():
-                            # Find the server's socket
-                            server_sock_obj = next((s for s, d in server_sockets.items() if d['name'] == name), None)
-                            if not server_sock_obj: continue
-
-                            # Calculate when the server would start this new job
-                            # It's either now or when its last job finishes.
-                            start_time = max(current_time, server_finish_times[name])
-                            
-                            processing_time = get_estimated_processing_time(config['type'], request_str)
-                            
-                            finish_time = start_time + processing_time
-
-                            if finish_time < earliest_finish_time:
-                                earliest_finish_time = finish_time
-                                best_server_name = name
-                        
-                        # Update the chosen server's estimated finish time
-                        server_finish_times[best_server_name] = earliest_finish_time
-                        
-                        # Find the socket for the chosen server
-                        chosen_server_socket = next((s for s, d in server_sockets.items() if d['name'] == best_server_name), None)
-                        
-                        if chosen_server_socket:
-                            print(f"Scheduling request '{request_str}' to server '{best_server_name}'. Estimated finish: {earliest_finish_time}")
-                            # Forward the request
-                            chosen_server_socket.send(request)
-                            # Map sockets for response routing
-                            client_to_server[sock] = chosen_server_socket
-                            server_to_client[chosen_server_socket] = sock
-                        else:
-                            print(f"Error: Could not find socket for chosen server {best_server_name}")
-                            inputs.remove(sock)
-                            sock.close()
-
-                    else:
-                        # Client closed connection without sending data
-                        print("Client disconnected.")
-                        inputs.remove(sock)
-                        sock.close()
-
-            # Handle exceptional conditions
-            for sock in exceptional:
-                print(f"Handling exceptional condition for {sock.getpeername()}")
-                inputs.remove(sock)
-                if sock in outputs:
-                    outputs.remove(sock)
-                sock.close()
-
+            client_conn, client_addr = listening_socket.accept()
+            thread = threading.Thread(target=handle_client, args=(client_conn, client_addr))
+            thread.daemon = True
+            thread.start()
     except KeyboardInterrupt:
-        print("\n--- Shutting down Load Balancer ---")
+        debug_print("\n--- Shutting down Load Balancer ---")
     finally:
-        # Clean up all sockets
-        for sock in inputs:
+        listening_socket.close()
+        for sock in server_sockets.values():
             sock.close()
+        debug_print("All sockets closed.")
+
 
 if __name__ == "__main__":
     main()
